@@ -1,0 +1,1 @@
+mod decompile_without_panics;

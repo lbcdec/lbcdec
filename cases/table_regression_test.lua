@@ -1,0 +1,23 @@
+local r0 = Classes.ScriptObjectBase:Inherit("Tree")
+r0._instanceVars = {
+    runEvents = NIL,
+    iShakeCount = 0,
+    bShaking = false,
+    fShakeBlend = 0,
+    bGrabbed = false,
+    timerGrowth = NIL,
+    timerFruitDrop = NIL,
+    timerWater = NIL,
+    jobAnimDynamic = NIL,
+    jobAnimStatic = NIL,
+    jobChop = NIL,
+    bChopForceStop = false,
+    fScaleCurrent = 1,
+    fScaleIncrement = 0,
+    fScaleMaximum = 1,
+    fxWater = NIL,
+    fxTransition = NIL,
+    fxLeaves = NIL,
+    shakeSoundID = NIL,
+    bGrowthTransitionPending = false
+}
