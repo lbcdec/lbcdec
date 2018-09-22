@@ -107,6 +107,16 @@ impl<'lb> ViewBuilder<'lb> {
         }
     }
 
+    pub fn has_pinned_before(&self, reg: Reg) -> bool {
+        self.context.iter_root().any(|view| {
+            if let &ViewType::PinnedExpression { dest } = &view.view_type {
+                dest == reg
+            } else {
+                false
+            }
+        })
+    }
+
     // Uses an expression view with the specified register, returns view id
     pub fn take_reg(&mut self, reg: Reg) -> ViewOrReg {
         if self.current_top.is_first() {
@@ -131,17 +141,8 @@ impl<'lb> ViewBuilder<'lb> {
 
         if let &ViewType::Expression { dest: dest_reg, .. } = &next_view.view_type {
             if dest_reg == reg {
-                // Check for a pinned expression in to reg in scope
-                let has_pinned = self.context.iter_root().any(|view| {
-                    if let &ViewType::PinnedExpression { dest } = &view.view_type {
-                        dest == reg
-                    } else {
-                        false
-                    }
-                });
-
-                // Can inline if the reg hasn't been pinned in the past
-                if !has_pinned {
+                // Can inline if the reg hasn't been pinned in the past (within scope)
+                if !self.has_pinned_before(reg) {
                     let top = self.commit_view(next_view);
                     return ViewOrReg::View(top)
                 }
@@ -167,15 +168,7 @@ impl<'lb> ViewBuilder<'lb> {
             return false
         }
 
-        let has_pinned = self.context.iter_root().any(|view| {
-            if let &ViewType::PinnedExpression { dest } = &view.view_type {
-                dest == reg
-            } else {
-                false
-            }
-        });
-
-        if has_pinned {
+        if self.has_pinned_before(reg) {
             return false
         }
 
@@ -196,13 +189,7 @@ impl<'lb> ViewBuilder<'lb> {
 
             res
         } else {
-            let has_pinned = self.context.iter_root().any(|view| {
-                if let &ViewType::PinnedExpression { dest } = &view.view_type {
-                    dest == reg
-                } else {
-                    false
-                }
-            });
+            let has_pinned = self.has_pinned_before(reg);
 
             panic!("Take strong failed for register {:?} (has_pinned: {:?})", reg, has_pinned);
         }
