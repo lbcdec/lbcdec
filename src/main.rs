@@ -497,6 +497,9 @@ end
         (@subcommand script =>
             (about: "Loads a Lua 5.1 script from the given file, compiles it with the system's luac5.1, and then decompiles it")
             (@arg INPUT: +required "The input file to use")
+            (@subcommand bulk =>
+                (about: "Decompiles Lua 5.1 bytecode from source in bulk, places the result next to the source file with the .dec.lua extension")
+            )
         )
         (@subcommand bytecode =>
             (about: "Loads Lua 5.1 bytecode from the given file and decompiles it")
@@ -524,15 +527,58 @@ end
 
     match matches.subcommand() {
         ("script", Some(matches)) => {
-            decompile_bytecode(&{
-                if let Some(script_path) = matches.value_of("INPUT") {
-                    let script = fs::read_to_string(script_path).unwrap();
-                    compile_lua(&script).unwrap()
-                } else {
-                    error!("Script path not specified");
-                    return;
+            let input = matches.value_of("INPUT");
+
+            match matches.subcommand() {
+                ("bulk", Some(_)) => {
+                    if let Some(source_glob) = input {
+                        let path_iter = glob::glob(source_glob).unwrap();
+
+                        use rayon::prelude::*;
+
+                        let source_files: Vec<_> = path_iter.filter_map(|file| {
+                            match file {
+                                Ok(f) => Some(f),
+                                Err(e) => {
+                                    error!("Globbing failed: {}", e);
+                                    None
+                                }
+                            }
+                        }).collect();
+
+                        source_files.par_iter().filter(|x| x.extension().and_then(|x| x.to_str()) != Some("dec.lua")).for_each(|file| {
+                            let script = fs::read_to_string(file).unwrap();
+                            let bytecode = compile_lua(&script).unwrap();
+                            let mut output = file.clone();
+                            output.set_extension("dec.lua");
+
+                            let res = std::panic::catch_unwind(|| {
+                                let mut output_writer = fs::File::create(&output).unwrap();
+                                decompile_bytecode_to(&bytecode, &mut output_writer);
+                            });
+
+                            if let Err(err) = res {
+                                use std::io::Write;
+                                let mut output_writer = fs::File::create(output).unwrap();
+                                writeln!(&mut output_writer, "Failed to decompile file at root level: {}", try_get_str_error(&err)).unwrap();
+                            }
+                        });
+                    } else {
+                        unimplemented!()
+                    }
+                },
+                _ => {
+                    decompile_bytecode(&{
+                        if let Some(script_path) = input {
+                            let script = fs::read_to_string(script_path).unwrap();
+                            compile_lua(&script).unwrap()
+                        } else {
+                            error!("Script path not specified");
+                            return;
+                        }
+                    })
                 }
-            })
+            }
         },
         ("bytecode", Some(matches)) => {
             match matches.subcommand() {
