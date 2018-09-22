@@ -131,12 +131,24 @@ impl<'lb> ViewBuilder<'lb> {
 
         if let &ViewType::Expression { dest: dest_reg, .. } = &next_view.view_type {
             if dest_reg == reg {
-                let top = self.commit_view(next_view);
-                ViewOrReg::View(top)
-            } else {
-                self.depend_on_register(reg);
-                ViewOrReg::Reg(reg)
+                // Check for a pinned expression in to reg in scope
+                let has_pinned = self.context.iter_root().any(|view| {
+                    if let &ViewType::PinnedExpression { dest } = &view.view_type {
+                        dest == reg
+                    } else {
+                        false
+                    }
+                });
+
+                // Can inline if the reg hasn't been pinned in the past
+                if !has_pinned {
+                    let top = self.commit_view(next_view);
+                    return ViewOrReg::View(top)
+                }
             }
+
+            self.depend_on_register(reg);
+            ViewOrReg::Reg(reg)
         } else {
             self.depend_on_register(reg);
             ViewOrReg::Reg(reg)
@@ -148,6 +160,26 @@ impl<'lb> ViewBuilder<'lb> {
             RK::K(constant) => ViewOrRegOrKst::Kst(constant),
             RK::R(reg) => self.take_reg(reg).into()
         }
+    }
+
+    pub fn can_take_reg_strong(&mut self, reg: Reg) -> bool {
+        if !self.free_mark.is_next_allocated(reg) {
+            return false
+        }
+
+        let has_pinned = self.context.iter_root().any(|view| {
+            if let &ViewType::PinnedExpression { dest } = &view.view_type {
+                dest == reg
+            } else {
+                false
+            }
+        });
+
+        if has_pinned {
+            return false
+        }
+
+        return true
     }
 
     pub fn take_reg_strong(&mut self, reg: Reg) -> ViewRef {
@@ -164,7 +196,15 @@ impl<'lb> ViewBuilder<'lb> {
 
             res
         } else {
-            panic!("Take strong failed for register {:?}", reg);
+            let has_pinned = self.context.iter_root().any(|view| {
+                if let &ViewType::PinnedExpression { dest } = &view.view_type {
+                    dest == reg
+                } else {
+                    false
+                }
+            });
+
+            panic!("Take strong failed for register {:?} (has_pinned: {:?})", reg, has_pinned);
         }
     }
 
@@ -740,7 +780,7 @@ impl<'lb> ViewBuilder<'lb> {
 
     pub fn take_simple_cond_tail(&mut self, dest: Reg) -> ViewRef {
         // Try a strong take first
-        if self.free_mark.is_next_allocated(dest) {
+        if self.can_take_reg_strong(dest) {
             return self.take_reg_strong(dest)
         }
 

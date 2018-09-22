@@ -740,3 +740,11 @@ impl ViewData for CloseViewData {
         context.write_reg(self.base);
     }
 }
+
+#[derive(Debug)]
+pub struct BackwardsJumpBarrierViewData;
+impl ViewData for BackwardsJumpBarrierViewData {
+    fn dump(&self, context: &mut DumpContext, _: DumpType) {
+        context.write_str("-- backwards jump barrier");
+    }
+}

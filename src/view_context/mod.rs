@@ -832,6 +832,18 @@ impl<'lb> ViewContext<'lb> {
 
         trace!("Process instruction {} {:?}", pc, &self.decoded[pc as usize]);
 
+        if !self.instr_ex[pc as usize].jump_sources.is_empty() {
+            let view = {
+                let mut builder = self.builder(None);
+                builder.build(
+                    Box::new(BackwardsJumpBarrierViewData),
+                    ViewType::Statement { assignment: None },
+                    make_view_key!(name: "backwards jump barrier", desc: "barrier emitted at backwards jump destinations to prevent inlines")
+                )
+            };
+            self.add_view(view)?;
+        }
+
         let view: Option<View> = {
             match self.decoded[pc as usize] {
                 LuaInstruction::Move { dest, source } => {
@@ -1777,14 +1789,11 @@ impl<'lb> ViewContext<'lb> {
                 if offset.is_backward() {
                     // while true do loop
                     let target = offset.apply(pc);
-                    let maybe_top = self.iter_root()
+                    let top = self.iter_root()
                         .take_while(|view| self.view_at(view.top).instructions.start >= target)
                         .map(|v| v.index)
-                        .last();
-                    if maybe_top.is_none() && target != pc {
-                        panic!("Empty while true do scope attempted to form, but there is bytecode within the range");
-                    }
-                    let top = maybe_top.unwrap_or(self.end_view());
+                        .last()
+                        .unwrap_or(self.end_view());
                     self.make_scope_including(top, make_view_key!(name: "while true scope", desc: "scope of a while true loop"))?;
                     let view = {
                         let mut builder = self.builder(None);
