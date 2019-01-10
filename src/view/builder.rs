@@ -117,8 +117,7 @@ impl<'lb> ViewBuilder<'lb> {
         })
     }
 
-    // Uses an expression view with the specified register, returns view id
-    pub fn take_reg(&mut self, reg: Reg) -> ViewOrReg {
+    fn take_reg_internal(&mut self, reg: Reg, ignore_pin: bool) -> ViewOrReg {
         if self.current_top.is_first() {
             self.depend_on_register(reg);
             return ViewOrReg::Reg(reg);
@@ -142,7 +141,7 @@ impl<'lb> ViewBuilder<'lb> {
         if let &ViewType::Expression { dest: dest_reg, .. } = &next_view.view_type {
             if dest_reg == reg {
                 // Can inline if the reg hasn't been pinned in the past (within scope)
-                if !self.has_pinned_before(reg) {
+                if ignore_pin || !self.has_pinned_before(reg) {
                     let top = self.commit_view(next_view);
                     return ViewOrReg::View(top)
                 }
@@ -156,6 +155,11 @@ impl<'lb> ViewBuilder<'lb> {
         }
     }
 
+    // Uses an expression view with the specified register, returns view id
+    pub fn take_reg(&mut self, reg: Reg) -> ViewOrReg {
+        self.take_reg_internal(reg, false)
+    }
+
     pub fn take_reg_or_kst(&mut self, rk: RK) -> ViewOrRegOrKst {
         match rk {
             RK::K(constant) => ViewOrRegOrKst::Kst(constant),
@@ -165,10 +169,6 @@ impl<'lb> ViewBuilder<'lb> {
 
     pub fn can_take_reg_strong(&mut self, reg: Reg) -> bool {
         if !self.free_mark.is_next_allocated(reg) {
-            return false
-        }
-
-        if self.has_pinned_before(reg) {
             return false
         }
 
@@ -184,7 +184,7 @@ impl<'lb> ViewBuilder<'lb> {
             panic!("Could not take strong register {:?}: At top of views", reg);
         }
 
-        if let ViewOrReg::View(res) = self.take_reg(reg) {
+        if let ViewOrReg::View(res) = self.take_reg_internal(reg, true) {
             self.last_strong = Some(self.dependent_view_count);
 
             res
