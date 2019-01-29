@@ -23,7 +23,8 @@ pub enum ViewType {
     Else { cond_index: ViewRef, end: u32 },
     ForPrep { base: Reg, end: u32 },
     TForPrep { base: Reg, count: u16, end: u32 },
-    SkippingLoadBool { dest: Reg, has_tail: bool }
+    SkippingLoadBool { dest: Reg, has_tail: bool },
+    RepeatUntilMarker { exit: u32 },
 }
 
 impl ViewType {
@@ -43,11 +44,11 @@ impl ViewType {
         match self {
             ViewType::Statement {..} => true,
             ViewType::PinnedExpression {..} => true,
+            ViewType::Expression {..} => true,
+            ViewType::MultiExpression {..} => true,
 
-            ViewType::Expression {..} => false,
             ViewType::SelfExpression {..} => false,
             ViewType::VarArgsExpression {..} => false,
-            ViewType::MultiExpression {..} => false,
             ViewType::Scope {..} => false,
             ViewType::PartialConditional {..} => false,
             ViewType::Conditional {..} => false,
@@ -55,6 +56,16 @@ impl ViewType {
             ViewType::ForPrep {..} => false,
             ViewType::TForPrep {..} => false,
             ViewType::SkippingLoadBool {..} => false,
+            ViewType::RepeatUntilMarker {..} => false,
+        }
+    }
+
+    pub fn needs_finalization(&self) -> bool {
+        match self {
+            // Expression types need finalization (but not really)
+            ViewType::Expression {..} => true,
+            ViewType::RepeatUntilMarker {..} => true,
+            _ => false,
         }
     }
 }

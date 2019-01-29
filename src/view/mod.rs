@@ -148,7 +148,7 @@ pub enum ViewBail {
     // Pins an expression at the given view.
     // All work is thrown out up until that point.
     // Also tags the tail instruction of the view with ViewTag::Pinned.
-    PinExpression {
+    PinExpression { // TODO: Rename to Rewind
         view: ViewRef
     },
     // Retries the given view.

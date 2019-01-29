@@ -37,10 +37,14 @@ extern crate rayon;
 #[macro_use]
 extern crate clap;
 
+extern crate either;
+
 use std::borrow::Cow;
 use std::fs;
 use std::io::{Error, ErrorKind};
 use std::process::Command;
+
+use either::{Either, Left, Right};
 
 mod ast;
 mod bytecode_reader;
@@ -49,6 +53,7 @@ mod dump;
 mod instruction_definitions;
 mod instruction_decoder;
 mod free_mark;
+mod ralloc;
 mod reduce;
 #[macro_use]
 mod view;
@@ -157,7 +162,7 @@ impl<'a, 'b> DumpContext for DumpContextImpl<'a, 'b> {
             if i != 0 {
                 self.write_newline();
             }
-            self.write_view(view.index, DumpType::Statement);
+            self.write_view(view.index, DumpType::Statement { last: i+1 == root_views.len() });
         }
     }
     
@@ -170,7 +175,7 @@ impl<'a, 'b> DumpContext for DumpContextImpl<'a, 'b> {
 
         // write!(self.writer, "--[[{:?}]]", view).unwrap();
 
-        if let DumpType::Statement = typ {
+        if let DumpType::Statement {..} = typ {
             let free_mark = &self.context.view_free_mark_at(index);
 
             if let &ViewType::Expression { dest, .. } = &view.view_type {

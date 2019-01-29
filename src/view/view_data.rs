@@ -376,15 +376,23 @@ pub struct ScopeViewData {
     pub statements: Vec<ViewRef>,
 }
 impl ViewData for ScopeViewData {
-    fn dump(&self, context: &mut DumpContext, _: DumpType) {
+    fn dump(&self, context: &mut DumpContext, typ: DumpType) {
+        let indent = if let DumpType::Statement { last } = typ { last } else { false };
         if !self.statements.is_empty() {
-            context.indent();
+            if indent { context.indent() }
             for (i, view) in self.statements.iter().rev().enumerate() {
-                context.write_view(*view, DumpType::Statement);
-                if i == self.statements.len()-1 {
-                    context.unindent();
+                let last = i == self.statements.len()-1;
+                context.write_view(*view, DumpType::Statement { last });
+                if indent {
+                    if last {
+                        context.unindent();
+                    }
+                    context.write_newline();
+                } else {
+                    if !last {
+                        context.write_newline();
+                    }
                 }
-                context.write_newline();
             }
         }
     }
@@ -543,7 +551,7 @@ impl ViewData for IfStatViewData {
         }
         context.write_str(" then");
         context.write_newline();
-        context.write_view(self.main_body, DumpType::Statement);
+        context.write_view(self.main_body, DumpType::Statement { last: true });
         context.write_str("end");
     }
 }
@@ -573,10 +581,10 @@ impl ViewData for IfElseStatViewData {
         }
         context.write_str(" then");
         context.write_newline();
-        context.write_view(self.main_body, DumpType::Statement);
+        context.write_view(self.main_body, DumpType::Statement { last: true });
         context.write_str("else");
         context.write_newline();
-        context.write_view(self.else_body, DumpType::Statement);
+        context.write_view(self.else_body, DumpType::Statement { last: true });
         context.write_str("end");
     }
 }
@@ -597,7 +605,7 @@ impl ViewData for WhileStatViewData {
         }
         context.write_str(" do");
         context.write_newline();
-        context.write_view(self.main_body, DumpType::Statement);
+        context.write_view(self.main_body, DumpType::Statement { last: true });
         context.write_str("end");
     }
 }
@@ -610,7 +618,7 @@ impl ViewData for WhileTrueStatViewData {
     fn dump(&self, context: &mut DumpContext, _: DumpType) {
         context.write_str("while true do");
         context.write_newline();
-        context.write_view(self.main_body, DumpType::Statement);
+        context.write_view(self.main_body, DumpType::Statement { last: true });
         context.write_str("end");
     }
 }
@@ -682,7 +690,7 @@ impl ViewData for ForViewData {
     fn dump(&self, context: &mut DumpContext, _: DumpType) {
         context.write_view(self.prep, DumpType::Expression);
         context.write_newline();
-        context.write_view(self.body, DumpType::Statement);
+        context.write_view(self.body, DumpType::Statement { last: true });
         context.write_str("end");
     }
 }
@@ -722,11 +730,15 @@ pub struct DoStatViewData {
     pub main_body: ViewRef,
 }
 impl ViewData for DoStatViewData {
-    fn dump(&self, context: &mut DumpContext, _: DumpType) {
-        context.write_str("do");
-        context.write_newline();
-        context.write_view(self.main_body, DumpType::Statement);
-        context.write_str("end");
+    fn dump(&self, context: &mut DumpContext, typ: DumpType) {
+        if let DumpType::Statement { last: true } = typ {
+            context.write_view(self.main_body, DumpType::Statement { last: false });
+        } else {
+            context.write_str("do");
+            context.write_newline();
+            context.write_view(self.main_body, DumpType::Statement { last: true });
+            context.write_str("end");
+        }
     }
 }
 
@@ -746,5 +758,42 @@ pub struct BackwardsJumpBarrierViewData;
 impl ViewData for BackwardsJumpBarrierViewData {
     fn dump(&self, context: &mut DumpContext, _: DumpType) {
         context.write_str("-- backwards jump barrier");
+    }
+}
+
+#[derive(Debug)]
+pub struct RepeatUntilMarkerViewData;
+impl ViewData for RepeatUntilMarkerViewData {
+    fn dump(&self, context: &mut DumpContext, _: DumpType) {
+        context.write_str("-- repeat until marker");
+    }
+}
+
+#[derive(Debug)]
+pub struct RepeatUntilViewData {
+    pub cond: (CondContext, Vec<ViewRef>),
+    pub body: Vec<ViewRef>,
+}
+impl ViewData for RepeatUntilViewData {
+    fn dump(&self, context: &mut DumpContext, _: DumpType) {
+        context.write_str("repeat");
+        context.write_newline();
+        if !self.body.is_empty() {
+            context.indent();
+            for (i, view) in self.body.iter().rev().enumerate() {
+                let last = i == self.body.len()-1;
+                context.write_view(*view, DumpType::Statement { last });
+                if last {
+                    context.unindent();
+                }
+                context.write_newline();
+            }
+        }
+        context.write_str("until ");
+        {
+            let mut cond_dumper = CondDumper::new(context, &self.cond.0, &self.cond.1);
+
+            self.cond.0.visit(&mut cond_dumper);
+        }
     }
 }

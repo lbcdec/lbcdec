@@ -43,6 +43,8 @@ enum ViewTag {
     /// Situations may come up where an expression can't be inlined somewhere, typically because it can't be used twice.
     /// When this happens, the expression is marked as pinned and a ViewBail is returned
     Pinned { view_key: ViewKeyRef },
+    RepeatUntilTail,
+    RepeatUntilLeaf,
 }
 
 /// Various free marks for a view.
@@ -98,6 +100,7 @@ pub struct ViewContext<'lb> {
     actual_param_count: u8,
     initial_free_mark: FreeMark,
     free_mark: FreeMark,
+    ralloc: crate::ralloc::RAllocData,
 }
 
 impl<'lb> ViewContext<'lb> {
@@ -107,32 +110,26 @@ impl<'lb> ViewContext<'lb> {
         let initial_reg_alloc = chunk.num_params + arg_alloc;
 
         let instr_len = chunk.instructions.len();
-        let mut context = ViewContext {
-            chunk: chunk,
-            decoded: Vec::with_capacity(instr_len),
-            instr_ex: Vec::with_capacity(instr_len),
-            views: vec![],
-            view_free_mark: vec![],
-            view_tags: Vec::with_capacity(instr_len),
-            pc: 0u32,
-            actual_param_count: initial_reg_alloc,
-            initial_free_mark: FreeMark::new(initial_reg_alloc),
-            free_mark: FreeMark::new(initial_reg_alloc),
-        };
 
-        let mut instr: &[u32] = &chunk.instructions;
+        let mut instructions: &[u32] = &chunk.instructions;
         let mut next_skip = SkipInfo::None;
         let mut pc = 0u32;
+
+        let mut decoded = Vec::with_capacity(instr_len);
+        let mut instr_ex = Vec::with_capacity(instr_len);
         
         trace!("0:");
-        while let Some((next_instr, decoded, instr_count)) = decode_instruction(instr, &chunk.prototypes) {
+        while let Some((next_instr, instr, instr_count)) = decode_instruction(instructions, &chunk.prototypes) {
             trace!("{}:", pc + instr_count);
-            instr = next_instr;
+            instructions = next_instr;
 
-            // println!("{}-{}: {:?}", pc, pc + instr_count - 1, decoded);
+            // Instructions are still in charge of inlining, but we eagerly bail when our base register doesn't match.
+            // We still allow strong register takes when the free mark doesn't match.
+            // We should modify the algorithm to take a "required free mark range" since base expressions tell us exactly whats allocated and what isn't.
+            trace!("{}-{}: {:?} (base: {:?})", pc, pc + instr_count - 1, instr, instr.info());
 
             // Figure out the skip info for the next instruction
-            let next_next_skip = match decoded {
+            let next_next_skip = match instr {
                 LuaInstruction::LoadBool { skip_next: true, .. } => SkipInfo::LoadBool,
                 LuaInstruction::BinCondOp { .. } => SkipInfo::Conditional { test_set: false },
                 LuaInstruction::Test { .. } => SkipInfo::Conditional { test_set: false },
@@ -141,7 +138,7 @@ impl<'lb> ViewContext<'lb> {
             };
 
             // If this instruction is a jump, figure out the right enum from the instruction type
-            let jump_source = match decoded {
+            let jump_source = match instr {
                 LuaInstruction::Jump { .. } => {
                     if let SkipInfo::Conditional { .. } = next_skip {
                         Some(JumpSource::ConditionalJump)
@@ -155,15 +152,15 @@ impl<'lb> ViewContext<'lb> {
             };
 
             // If this instruction is a jump, get the jump offset and apply it to the current program counter
-            let jump_location = match decoded {
+            let jump_location = match instr {
                 LuaInstruction::Jump { offset } => Some(offset),
                 LuaInstruction::ForLoop { target, .. } => Some(target),
                 LuaInstruction::ForPrep { target, .. } => Some(target),
                 _ => None,
             }.map(|offset| offset.apply(pc));
 
-            context.decoded.push(decoded);
-            context.instr_ex.push(InstrExdata {
+            decoded.push(instr);
+            instr_ex.push(InstrExdata {
                 jump_sources: vec![],
                 skipped_by_previous: next_skip,
                 jump_to: jump_location,
@@ -171,8 +168,8 @@ impl<'lb> ViewContext<'lb> {
 
             // Pad long instructions with semantic no ops
             for _ in 0..(instr_count - 1) {
-                context.decoded.push(LuaInstruction::SemanticNoOp);
-                context.instr_ex.push(InstrExdata {
+                decoded.push(LuaInstruction::SemanticNoOp);
+                instr_ex.push(InstrExdata {
                     jump_sources: vec![],
                     skipped_by_previous: SkipInfo::None,
                     jump_to: None,
@@ -182,13 +179,29 @@ impl<'lb> ViewContext<'lb> {
             // If this instruction is jumping backwards somewhere, link the source and destination
             if let Some(dest_pc) = jump_location {
                 if dest_pc <= pc {
-                    context.instr_ex[dest_pc as usize].jump_sources.push((jump_source.unwrap(), pc));
+                    instr_ex[dest_pc as usize].jump_sources.push((jump_source.unwrap(), pc));
                 }
             }
 
             next_skip = next_next_skip;
             pc = pc + instr_count;
         }
+
+        let ralloc = crate::ralloc::run(&decoded[..]);
+
+        let mut context = ViewContext {
+            chunk: chunk,
+            decoded,
+            instr_ex,
+            views: vec![],
+            view_free_mark: vec![],
+            view_tags: Vec::with_capacity(instr_len),
+            pc: 0u32,
+            actual_param_count: initial_reg_alloc,
+            initial_free_mark: FreeMark::new(initial_reg_alloc),
+            free_mark: FreeMark::new(initial_reg_alloc),
+            ralloc,
+        };
 
         context.view_tags.resize(instr_len, None);
 
@@ -197,107 +210,134 @@ impl<'lb> ViewContext<'lb> {
 
     pub fn decompile(&mut self) {
         let mut pc = 0;
-        while pc < self.decoded.len() {
+        while pc <= self.decoded.len() {
+            if pc == self.decoded.len() {
+                let end_view = self.end_view();
+                match self.try_finalize(ViewRef::from(0)..end_view) {
+                    Ok(can_create) => {
+                        if !can_create {
+                            println!("Failed to correctly decompile: Non-statement views detected during chunk finalization. Finalization aborted.");
+                        }
+                    },
+                    Err(bail) => {
+                        if self.handle_view_bail(bail, &mut pc) {
+                            continue
+                        }
+                    },
+                }
+
+                pc += 1;
+                continue
+            }
+
             if let Err(bail) = self.process_instruction(pc as u32) {
-                trace!("Bail {:?}", bail);
-                match bail {
-                    ViewBail::PinExpression { mut view } => {
-                        pc = self.view_at(view).instructions.end as usize;
-                        // Adjust view to not include any instructions at or after pc
-                        loop {
-                            if view.is_first() {
-                                break
-                            }
-                            let prev: ViewRef = (view.raw() - 1).into();
-                            if (self.view_at(prev).instructions.end as usize) >= pc {
-                                view = prev
-                            } else {
-                                break
-                            }
-                        }
-                        // Throw away views until `view-1`
-                        self.revert_to(view);
-                        continue;
-                    },
-                    ViewBail::ImplicitNil { start, end } => {
-                        pc = 0;
-                        self.revert_to(0.into());
-
-                        let view = {
-                            let mut builder = self.builder(None);
-                            let mut lhs = vec![];
-                            {
-                                let mut reg = start;
-                                loop {
-                                    lhs.push(FullAssignmentLHS::Local(reg));
-                                    if reg == end {
-                                        break;
-                                    }
-                                    reg = reg.next();
-                                }
-                            }
-                            builder.allocate(start..end);
-                            builder.build(
-                                // TODO: Give the ViewType to the debug print fn instead of this
-                                Box::new(ImplicitNilViewData {
-                                    start,
-                                    end
-                                }),
-                                ViewType::assignment(AssignmentInfo {
-                                    lhs: AssignmentLHS::Full(lhs),
-                                    sources: vec![],
-                                    allocated_local: true
-                                }),
-                                make_view_key!(name: "implicit nil", desc: "leading implicit nils of a lua chunk, emitted within a bail")
-                            )
-                        };
-                        // We shouldn't bail here, ever.
-                        self.add_view(view).expect("Hit view bail while trying to add ImplicitNilViewData");
-
-                        continue;
-                    },
-                    ViewBail::ScopeWrap { view, rewind_view, retry } => {
-                        if let Some(mut rewind_view) = rewind_view {
-                            // TODO: Deduplicate bail rewind code
-                            pc = self.view_at(rewind_view).instructions.end as usize;
-                            // Adjust view to not include any instructions at or after pc
-                            loop {
-                                if rewind_view.is_first() {
-                                    break
-                                }
-                                let prev: ViewRef = (rewind_view.raw() - 1).into();
-                                if (self.view_at(prev).instructions.end as usize) >= pc {
-                                    rewind_view = prev
-                                } else {
-                                    break
-                                }
-                            }
-                            // Throw away views until `view-1`
-                            self.revert_to(rewind_view);
-                        }
-
-                        self.make_scope_including(view, make_view_key!(name: "do block scope", desc: "emitted within bail for do block")).expect("Hit view bail during ScopeWrap");
-                        
-                        let view = {
-                            let mut builder = self.builder(None);
-                            let main_body = builder.take_scope();
-                            builder.build(
-                                Box::new(DoStatViewData { main_body }),
-                                ViewType::simple_statement(),
-                                make_view_key!(name: "do block", desc: "emitted within a bail")
-                            )
-                        };
-                        
-                        self.add_view(view).expect("Hit view bail adding DoStatViewData during ScopeWrap");
-                        
-                        if retry {
-                            continue;
-                        }
-                    },
+                if self.handle_view_bail(bail, &mut pc) {
+                    continue
                 }
             }
 
             pc += 1;
+        }
+    }
+
+    fn handle_view_bail(&mut self, bail: ViewBail, pc: &mut usize) -> bool {
+        trace!("Bail {:?}", bail);
+        match bail {
+            ViewBail::PinExpression { mut view } => {
+                *pc = self.view_at(view).instructions.end as usize;
+                // Adjust view to not include any instructions at or after pc
+                loop {
+                    if view.is_first() {
+                        break
+                    }
+                    let prev: ViewRef = (view.raw() - 1).into();
+                    if (self.view_at(prev).instructions.end as usize) >= *pc {
+                        view = prev
+                    } else {
+                        break
+                    }
+                }
+                // Throw away views until `view-1`
+                self.revert_to(view);
+                return true;
+            },
+            ViewBail::ImplicitNil { start, end } => {
+                *pc = 0;
+                self.revert_to(0.into());
+
+                let view = {
+                    let mut builder = self.builder(None);
+                    let mut lhs = vec![];
+                    {
+                        let mut reg = start;
+                        loop {
+                            lhs.push(FullAssignmentLHS::Local(reg));
+                            if reg == end {
+                                break;
+                            }
+                            reg = reg.next();
+                        }
+                    }
+                    builder.allocate(start..end);
+                    builder.build(
+                        // TODO: Give the ViewType to the debug print fn instead of this
+                        Box::new(ImplicitNilViewData {
+                            start,
+                            end
+                        }),
+                        ViewType::assignment(AssignmentInfo {
+                            lhs: AssignmentLHS::Full(lhs),
+                            sources: vec![],
+                            allocated_local: true
+                        }),
+                        make_view_key!(name: "implicit nil", desc: "leading implicit nils of a lua chunk, emitted within a bail")
+                    )
+                };
+                // We shouldn't bail here, ever.
+                self.add_view(view).expect("Hit view bail while trying to add ImplicitNilViewData");
+
+                return true;
+            },
+            ViewBail::ScopeWrap { view, rewind_view, retry } => {
+                if let Some(mut rewind_view) = rewind_view {
+                    // TODO: Deduplicate bail rewind code
+                    *pc = self.view_at(rewind_view).instructions.end as usize;
+                    // Adjust view to not include any instructions at or after pc
+                    loop {
+                        if rewind_view.is_first() {
+                            break
+                        }
+                        let prev: ViewRef = (rewind_view.raw() - 1).into();
+                        if (self.view_at(prev).instructions.end as usize) >= *pc {
+                            rewind_view = prev
+                        } else {
+                            break
+                        }
+                    }
+                    // Throw away views until `view-1`
+                    self.revert_to(rewind_view);
+                }
+
+                self.make_scope_including(view, make_view_key!(name: "do block scope", desc: "emitted within bail for do block")).expect("Hit view bail during ScopeWrap");
+                
+                let view = {
+                    let mut builder = self.builder(None);
+                    let main_body = builder.take_scope();
+                    builder.build(
+                        Box::new(DoStatViewData { main_body }),
+                        ViewType::simple_statement(),
+                        make_view_key!(name: "do block", desc: "emitted within a bail")
+                    )
+                };
+                
+                self.add_view(view).expect("Hit view bail adding DoStatViewData during ScopeWrap");
+                
+                if retry {
+                    return true
+                } else {
+                    return false
+                }
+            },
         }
     }
 
@@ -372,6 +412,11 @@ impl<'lb> ViewContext<'lb> {
                 panic!("Tried to tag a {:?} instruction as {:?}", old, tag);
             }
         }
+    }
+
+    fn replace_view_tag(&mut self, view: ViewRef, tag: ViewTag) {
+        let view_instr_end = self.view_at(view).instructions.end;
+        self.view_tags[view_instr_end as usize] = Some(tag.clone());
     }
 
     fn can_pin_view(&self, view: ViewRef) -> bool {
@@ -491,7 +536,7 @@ impl<'lb> ViewContext<'lb> {
                     }
                 }
             } else if let ViewType::TForPrep { base, count, .. } = view.view_type {
-                for i in 0..(3 + count as u8) {
+                for i in 0..(3 + count as u8 + 1) {
                     let dest = Reg(base.0 + i);
                     if dependent_reg_top.is_at_or_above(dest) {
                         if let &PinMode::None = &results[dest.0 as usize] {
@@ -572,8 +617,7 @@ impl<'lb> ViewContext<'lb> {
                         for view in &self.views {
                             warn!("{:?}", view)
                         }
-                        let root: Vec<_> = self.iter_root().collect();
-                        panic!("Could not find r{} in scope (results: {:?}, root views: {:?}, views: {:?}, tags: {:?}, decoded: {:?}, dependent reg top: {:?})", i, results, root, self.views, self.view_tags, self.decoded, dependent_reg_top)
+                        panic!("Could not find r{} in scope (\nresults: {:?},\ntags: {:?},\ndecoded: {:?},\ndependent reg top: {:?},\nview dump:\n{})", i, results, self.view_tags, self.decoded, dependent_reg_top, self.debug_view_dump())
                     }
                 },
                 &PinMode::Pinned => (), // Nothing to do
@@ -658,15 +702,15 @@ impl<'lb> ViewContext<'lb> {
         // Shouldn't everything already be pinned?
         // Not sure if you can have a free mark v base register conflict inside of an expression since an expression
         // context grows the top linearly... and expressions within another expression can't just simply go unused.
-        if view.view_type.is_statement_level() {
-            // We can only implicitly close statements
-            if let Some(base) = view.base {
-                if !root_incoming_free_mark.is_next_free(base) {
-                    // Will bail if successful
-                    self.try_close(base, Some(view.dependent_view_count), true)?
-                }
-            }
-        }
+        // if view.view_type.is_statement_level() {
+        //     // We can only implicitly close statements
+        //     if let Some(base) = view.base {
+        //         if !root_incoming_free_mark.is_next_free(base) {
+        //             // Will bail if successful
+        //             self.try_close(base, Some(view.dependent_view_count), true)?
+        //         }
+        //     }
+        // }
 
         self.views.push(view);
         self.view_free_mark.push(ViewFreeMarkInfo {
@@ -721,6 +765,11 @@ impl<'lb> ViewContext<'lb> {
     /// 
     /// Either returns nothing or a bail result.
     fn make_scope_after(&mut self, view: ViewRef, key: ViewKeyRef) -> Result<(), ViewBail> {
+        let end_view = self.end_view();
+        let all_ok = self.try_finalize((view + 1)..end_view)?;
+        if !all_ok {
+            eprintln!("Can't create a scope around views that aren't at statement level");
+        }
         let view = {
             let mut builder = self.builder(None);
             let statements = builder.take_views_until(|v| v.index <= view);
@@ -735,6 +784,11 @@ impl<'lb> ViewContext<'lb> {
 
     /// Creates a scope like [make_scope_after], but instead of being exclusive its inclusive.
     fn make_scope_including(&mut self, view: ViewRef, key: ViewKeyRef) -> Result<(), ViewBail> {
+        let end_view = self.end_view();
+        let all_ok = self.try_finalize(view..end_view)?;
+        if !all_ok {
+            eprintln!("Can't create a scope around views that aren't at statement level");
+        }
         let view = {
             let mut builder = self.builder(None);
             let statements = builder.take_views_until(|v| v.index < view);
@@ -808,19 +862,124 @@ impl<'lb> ViewContext<'lb> {
         if let Some((view_index, _)) = possible_fix {
             // All root views from top_view-1 to possible_fix need to be statement level, so check them
             let range_end = top_view.unwrap_or(self.end_view());
-            let all_ok = self.iter_root()
-                .filter(|view| view.index >= view_index && view.index < range_end)
-                .all(|view| view.view_type.is_statement_level());
+            let all_ok = self.try_finalize(view_index..range_end)?;
 
             if !all_ok {
-                println!("Can't create a scope around views that aren't at statement level");
+                eprintln!("Can't create a scope around views that aren't at statement level");
                 return Ok(())
             }
 
             Err(ViewBail::ScopeWrap { view: view_index, rewind_view: top_view, retry })
         } else {
+            println!("Possible fix not found!");
             Ok(())
         }
+    }
+
+    fn try_finalize(&mut self, range: Range<ViewRef>) -> Result<bool, ViewBail> {
+        // Check if there are any views to finalize, also check if there are non statement level views
+        let mut has_finalizations = false;
+        for view in self.iter_root() {
+            if view.index < range.start { break }
+            if view.index >= range.end { continue }
+            if view.view_type.needs_finalization() {
+                has_finalizations = true;
+            } else if !view.view_type.is_statement_level() {
+                println!("Non-statement view type: {:?}", view.view_type);
+                return Ok(false) // Non-statement level view, can't finalize range
+            }
+        }
+
+        if has_finalizations {
+            let mut last_exit = self.decoded.len() as u32;
+            let mut repeat_until_index = 0;
+            let mut bail = None;
+            let mut following_base: Option<Reg> = None;
+
+            let mut tags = Vec::new();
+
+            for view in self.iter_root() {
+                // println!("{:?} {:?} {:?}", self.view_free_mark_at(view.index), view.view_type, view.base);
+                // TODO: Check if following views have a base that isn't allowed for a repeat until
+                match view.view_type {
+                    ViewType::RepeatUntilMarker { exit } => {
+                        // println!("{:?} {:?}", last_exit, exit);
+                        let top_index = self.iter_root().filter(|view| view.instructions.end == exit).next().unwrap().index;
+                        let top_free_mark = self.view_free_mark_at(top_index);
+                        // println!("Free marks: {:?} {:?}", top_free_mark, following_base);
+                        let free_mark_ok = match following_base {
+                            Some(base) => top_free_mark.outgoing.is_next_free(base),
+                            None => true,
+                        };
+                        if last_exit != exit && free_mark_ok {
+                            last_exit = exit;
+                            repeat_until_index += 1;
+
+                            // Tag as Tail
+                            tags.push((view.index - 1, ViewTag::RepeatUntilTail))
+                        } else {
+                            // Tag as Leaf
+                            tags.push((view.index - 1, ViewTag::RepeatUntilLeaf))
+                        }
+                        bail = Some(view.index);
+                    },
+                    _ => {},
+                }
+
+                if let Some(base) = view.base {
+                    if let Some(ref mut following_base) = following_base {
+                        if following_base.is_above(base) {
+                            *following_base = base;
+                        }
+                    } else {
+                        following_base = Some(base);
+                    }
+                }
+            }
+
+            for (index, tag) in tags.into_iter() {
+                // println!("{:?} {:?}", index, tag);
+                self.tag_view_instr(index, tag);
+            }
+
+            if let Some(bail) = bail {
+                return Err(ViewBail::PinExpression {
+                    view: bail
+                })
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn debug_view_dump(&self) -> String {
+        let mut views = Vec::new();
+        let mut indent = String::from("");
+
+        fn dump_recursive<'a>(iter: &mut impl Iterator<Item=&'a View>, output: &mut Vec<String>, indent: &mut String) -> bool {
+            let view = iter.next();
+            if let Some(view) = view {
+                // Emit header
+                if view.dependent_view_count != 0 {
+                    output.push(format!("{}}}\n", indent));
+                    indent.push_str("  ");
+                    for _ in 0..view.dependent_view_count {
+                        dump_recursive(iter, output, indent);
+                    }
+                    let i = indent.len();
+                    indent.truncate(i - 2);
+                }
+                output.push(format!("{}{:?}{}\n", indent, view, if view.dependent_view_count != 0 { " {" } else { "" }));
+                true
+            } else {
+                false
+            }
+        }
+        let mut iter = self.views.iter().rev();
+        while dump_recursive(&mut iter, &mut views, &mut indent) {}
+        
+        views.reverse();
+        views.join("")
     }
 
     /// Processes a single instruction at pc.
@@ -830,7 +989,42 @@ impl<'lb> ViewContext<'lb> {
         self.pc = pc;
         let last_instr = pc as usize == (self.decoded.len() - 1);
 
-        trace!("Process instruction {} {:?}", pc, &self.decoded[pc as usize]);
+        #[cfg(debug_assertions)]
+        println!("Process instruction {} {:?}", pc, &self.decoded[pc as usize]);
+
+        match self.decoded[pc as usize] {
+            // Not allowed to utilize ralloc feedback from the following instructions:
+            LuaInstruction::Jump {..} => {}
+            _ => {
+                if let Some(ralloc_incoming) = self.ralloc.incoming_free_mark_at(pc as usize) {
+                    if !self.free_mark().is_next_free(ralloc_incoming) {
+                        println!("Ralloc mismatch! {:?} {:?}", self.free_mark(), ralloc_incoming);
+                        self.try_close(ralloc_incoming, None, true)?;
+                        // Fail, set the free mark manually
+                        // self.free_mark = FreeMark::new(ralloc_incoming.0);
+                    }
+                }
+            }
+        }
+
+        // let instr_info = self.decoded[pc as usize].info();
+
+        // match instr_info {
+        //     Some(InstructionInfo::Stack { base, inputs, outputs }) => {
+        //         if !self.free_mark().is_next_allocated((base + inputs).unwrap()) {
+        //             // Look at previous instructions to see what we need
+        //             // If inputs is not empty, look for the first input (at base) (a decouple'd setter)
+        //             // let top = &self.decoded[..pc as usize].iter().rev()
+        //             //     .skip_while(|instr| !instr.does_use(|reg| {
+        //             //         println!("{:?} {}", reg, base.is_above(reg));
+        //             //         base.is_above(reg)
+        //             //     })).next();
+
+        //             panic!("Free mark doesn't match instruction base at {} {:?}", pc, top);
+        //         }
+        //     },
+        //     None => {},
+        // }
 
         if !self.instr_ex[pc as usize].jump_sources.is_empty() {
             let view = {
@@ -1144,7 +1338,7 @@ impl<'lb> ViewContext<'lb> {
 
                                         let values = builder.take_generic_for_params(base);
 
-                                        builder.allocate(base..Reg(base.0 + 3 + (count as u8)));
+                                        builder.allocate(base..Reg(base.0 + 3 + (count as u8 - 1)));
 
                                         builder.build(
                                             Box::new(TForPrepViewData { values, base, count }),
@@ -1173,6 +1367,7 @@ impl<'lb> ViewContext<'lb> {
                     
                     Some({
                         let mut builder = self.builder(Some(base));
+                        builder.base(base);
                         let mut args = vec![];
                         let mut top = match arg_count.count() {
                             Some(_) => (base + arg_count).unwrap(),
@@ -1193,7 +1388,6 @@ impl<'lb> ViewContext<'lb> {
                             top = top.previous().unwrap();
                         }
                         let func = builder.take_call_func(base);
-                        builder.base(base);
                         if !(ret_count.is_empty() || ret_count.is_varargs()) {
                             builder.allocate(base..(base + ret_count).unwrap().previous().unwrap());
                         }
@@ -1221,7 +1415,11 @@ impl<'lb> ViewContext<'lb> {
 
                     Some({
                         let mut builder = self.builder(Some(base));
-                        let object = builder.take_reg(object);
+                        let object = if object == base {
+                            ViewOrReg::View(builder.take_reg_strong(object))
+                        } else {
+                            builder.take_reg(object)
+                        };
                         let method = if let RK::K(constant) = method {
                             constant
                         } else {
@@ -1486,8 +1684,12 @@ impl<'lb> ViewContext<'lb> {
             SimpleCondExpr { cond_index: ViewRef, dest: Reg },
             LoadBoolCondExpr { cond_index: ViewRef, dest: Reg, has_tail: bool },
             CondAssign { cond_index: ViewRef, dest: Reg },
+            PartialRepeatUntil { cond_index: ViewRef, exit: u32 },
+            RepeatUntil { cond_index: ViewRef, exit: u32 },
             None
         }
+
+        let mut handled_repeat_until = false;
 
         // Iterate through root views looking for any conditional jumps landing on the next instruction
         // If a conditional jump lands on the next instruction, then there is an if statement.
@@ -1606,6 +1808,34 @@ impl<'lb> ViewContext<'lb> {
                             }
 
                             break 'outer IterResult::IfStat { cond_index: root_view.index, else_end_pc, exit };
+                        } else if exit < pc && pc == root_view.instructions.start && !handled_repeat_until {
+                            handled_repeat_until = true;
+
+                            match self.current_tag() {
+                                Some(ViewTag::RepeatUntilLeaf) => {
+                                    break
+                                },
+                                Some(ViewTag::RepeatUntilTail) => {
+                                    break 'outer IterResult::RepeatUntil { cond_index: root_view.index, exit };
+                                },
+                                _ => (),
+                            }
+
+                            // Game plan: tag with PartialRepeatUntil, in block/scope finalization pass we find partial repeat until strides and we replace the tag with RepeatUntil, and then we start rebuilding after the earliest RepeatUntil
+
+
+                            // i guess i can emit a repeat until at each unhandled backwards jump
+                            // and then collapse them if needed
+                            // repeat body until x and y would generate repeat body until x first, then it would wrap it in a repeat % until y
+                            // and i could detect this and emit a tag that tells it to not emit repeat % until x so that it'll do until x and y
+                            // but
+                            // i'd rather not do that
+
+                            // potential scope issues: if we get a base register disagreement, we have to check to see if there's a repeat until before us where the base register does agree
+                            // if there is, we exclude the trailing conditional from creating a repeat until and we bail
+                            // key word: where the base register _does_ agree
+                            // could potentially be an issue if the register is an implicit nil, an allocation happens inside of the repeat until, and an unrelated based expr causes the repeat until to break apart
+                            break 'outer IterResult::PartialRepeatUntil { cond_index: root_view.index, exit };
                         } else {
                             break;
                         }
@@ -1779,6 +2009,49 @@ impl<'lb> ViewContext<'lb> {
                         }
                     };
                     self.add_view(view)?;
+                },
+                IterResult::PartialRepeatUntil { exit, .. } => {
+                    let view = {
+                        let mut builder = self.builder(None);
+                        builder.take_single_view();
+                        builder.build(
+                            Box::new(RepeatUntilMarkerViewData),
+                            ViewType::RepeatUntilMarker { exit },
+                            make_view_key!(name: "repeat until marker", desc: "marker view for a partially decompiled repeat until statement")
+                        )
+                    };
+                    self.add_view(view)?;
+                },
+                IterResult::RepeatUntil { cond_index, exit } => {
+                    // This part of the pass should have complete statements in the block
+                    // If we have something invalid at the statement level then we should bail and flag all conditional instructions as not part of a repeat until
+
+                    let view = 'repeat: loop {
+                        let start = self.view_at(cond_index).instructions.end + 1;
+
+                        let mut builder = self.builder(None);
+                        let cond = builder.take_conditional(start, exit);
+                        let block = builder.take_views_until(|view| view.instructions.start < exit);
+                        for index in block.iter() {
+                            if !self.view_at(*index).view_type.is_statement_level() {
+                                println!("WARN: Repeat until caused invalid block potentially");
+                                break 'repeat Err(cond.1)
+                            }
+                        }
+                        break 'repeat Ok(builder.build(
+                            Box::new(RepeatUntilViewData { cond, body: block }),
+                            ViewType::simple_statement(),
+                            make_view_key!(name: "repeat until", desc: "repeat until loop")
+                        ))
+                    };
+                    match view {
+                        Ok(view) => self.add_view(view)?,
+                        Err(reset_conditionals) => {
+                            for view in reset_conditionals {
+                                self.replace_view_tag(view, ViewTag::RepeatUntilLeaf)
+                            }
+                        }
+                    }
                 },
                 IterResult::None => break
             }

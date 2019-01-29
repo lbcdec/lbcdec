@@ -3,7 +3,7 @@ use view::ViewRef;
 
 #[derive(Debug)]
 pub enum DumpType {
-    Statement,
+    Statement { last: bool },
     Expression,
     Conditional { inverted: bool }
 }

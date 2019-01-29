@@ -109,10 +109,13 @@ impl<'lb> ViewBuilder<'lb> {
 
     pub fn has_pinned_before(&self, reg: Reg) -> bool {
         self.context.iter_root().any(|view| {
-            if let &ViewType::PinnedExpression { dest } = &view.view_type {
-                dest == reg
-            } else {
-                false
+            match view.view_type {
+                ViewType::PinnedExpression { dest } if dest == reg => true,
+                ViewType::TForPrep { base, count, .. } => {
+                    let top = (base + Count::from(3 + count - 1)).unwrap();
+                    reg.is_at_or_above(base) && top.is_at_or_above(reg)
+                },
+                _ => false
             }
         })
     }
@@ -172,10 +175,18 @@ impl<'lb> ViewBuilder<'lb> {
             return false
         }
 
+        if self.has_pinned_before(reg) {
+            return false
+        }
+
         return true
     }
 
     pub fn take_reg_strong(&mut self, reg: Reg) -> ViewRef {
+        if self.base.is_none() {
+            eprintln!("WARN: take_reg_strong({:?}) called without a defined base", reg);
+        }
+
         if !self.free_mark.is_next_allocated(reg) {
             panic!("Could not take strong register {:?}: Would cause free mark instability with {:?}", reg, self.context.free_mark());
         }
@@ -184,7 +195,7 @@ impl<'lb> ViewBuilder<'lb> {
             panic!("Could not take strong register {:?}: At top of views", reg);
         }
 
-        if let ViewOrReg::View(res) = self.take_reg_internal(reg, true) {
+        if let ViewOrReg::View(res) = self.take_reg_internal(reg, false) {
             self.last_strong = Some(self.dependent_view_count);
 
             res
@@ -258,6 +269,11 @@ impl<'lb> ViewBuilder<'lb> {
             }
         }
         out
+    }
+
+    pub fn take_single_view(&mut self) -> ViewRef {
+        let next_view = self.next_view();
+        self.commit_view(next_view)
     }
 
     pub fn take_scope(&mut self) -> ViewRef {
